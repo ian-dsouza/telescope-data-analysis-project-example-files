@@ -31,8 +31,8 @@ from typing import Any
 SCRIPT_EXECUTION_START = time.perf_counter()
 
 
-# Report total runtime at exit. Subtract the startup timer from the current
-# performance counter and print the elapsed seconds.
+# Print the total runtime at exit. This helps compare how long different worker
+# counts or batch sizes take.
 def report_execution_time() -> None:
     elapsed_seconds = time.perf_counter() - SCRIPT_EXECUTION_START
     print(f"Execution time: {elapsed_seconds:.2f} seconds", flush=True)
@@ -65,8 +65,8 @@ SCRIPT_DIR = SCRIPT_PATH.parent
 OUTPUT_DIR = SCRIPT_DIR / "Data"
 
 
-# Collect the settings for the configured case. Return a dictionary of input
-# paths, naming options, and settings for binning and engine setup.
+# Define which event datasets and parameter values to load, and which binning
+# rules to apply. Return the paths and settings used throughout the run.
 def get_case_configuration() -> dict[str, Any]:
     """Return all case-specific scientific settings and paths."""
 
@@ -115,7 +115,6 @@ def get_case_configuration() -> dict[str, Any]:
     countbinspace = "linear"
     N_side = ...
 
-    # AEGIS configuration copied from the training-data notebook.
     energy_range = [1_000, 100_000]  # MeV
     max_radius = ...  # kpc
     exposure = ...  # cm^2 yr
@@ -149,8 +148,8 @@ def get_case_configuration() -> dict[str, Any]:
     }
 
 
-# Complete the run configuration. Copy the case settings, then add the engine
-# source path, expected histogram dimensions, and engine defaults.
+# Derive the expected histogram shape from the count and energy bins. Add the
+# source path and setup settings for the routines that build the features.
 def add_shared_configuration(
     case_configuration: dict[str, Any],
 ) -> dict[str, Any]:
@@ -188,15 +187,15 @@ def add_shared_configuration(
     return configuration
 
 
-# Validate a required file path. Raise a FileNotFoundError with the input label
-# and path if it does not point to a regular file.
+# Check that a required dataset or supporting file is present. If the path does
+# not point to a regular file, report its role and location.
 def require_regular_file(path: Path, label: str) -> None:
     if not path.is_file():
         raise FileNotFoundError(f"{label} does not exist or is not a file: {path}")
 
 
-# Fingerprint a file for later comparison. Feed one-megabyte chunks into a
-# SHA-256 hash and return its hexadecimal digest.
+# Create a checksum that can identify a file's exact contents across runs. Read
+# the file in chunks to limit memory use when checking large inputs.
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -205,8 +204,8 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-# Describe an input file for the run metadata. Verify the file, record its
-# path, size, and modification time, and include a content hash when requested.
+# Record the path, size, and modification time of a source file. Add a content
+# checksum when requested so later runs can check whether the file changed.
 def file_record(path: Path, *, include_sha256: bool) -> dict[str, Any]:
     require_regular_file(path, "Required file")
     stat = path.stat()
@@ -220,9 +219,9 @@ def file_record(path: Path, *, include_sha256: bool) -> dict[str, Any]:
     return record
 
 
-# Load event datasets from a trusted pickle. Check the required fields, numeric
-# array types, and matching row counts, then return the datasets and their
-# individual event counts.
+# Load the event datasets and check that every event has two coordinates and
+# one energy value. Require numeric arrays and record each dataset's event
+# count so differences in dataset size are visible.
 def load_and_validate_raw_photon_data(
     path: Path,
 ) -> tuple[list[dict[str, Any]], list[int]]:
@@ -289,9 +288,9 @@ def load_and_validate_raw_photon_data(
     return data_list, photon_counts
 
 
-# Provide one parameter row per dataset. Load the tensor on the CPU, validate
-# its shape and values, and repeat a shared row or copy the existing rows.
-# Return the aligned array and a record of how it was prepared.
+# Match the supplied model parameter values to the feature rows. Check the
+# number of parameters and require finite values. Repeat a shared parameter row
+# or keep the supplied rows in input order.
 def load_and_align_theta(
     path: Path,
     *,
@@ -367,8 +366,9 @@ def load_and_align_theta(
     return aligned_theta, details
 
 
-# Combine count limits from several input files. Validate each array, record
-# its values and file details, and take the maximum at each array position.
+# Set an upper count limit for each energy band using the largest value across
+# the training files. Check that each file has one valid count per band and
+# record the original values for traceability.
 def load_max_C_per_energy_bin(
     paths: list[Path],
     *,
@@ -423,14 +423,14 @@ def load_max_C_per_energy_bin(
 class NotebookCompatibleAegis:
     """Expose the notebook's array-only API without changing its numerics."""
 
-    # Wrap an existing processing engine. Store it so the adapter methods can
-    # delegate their work to it.
+    # Keep a reference to the configured AEGIS engine so the count maps and
+    # histograms use the same processing settings.
     def __init__(self, engine: Any) -> None:
         self._engine = engine
 
-    # Give callers a consistent NumPy array return type. Use the first item of
-    # a tuple result, raise an error for an empty tuple, and convert the result
-    # to an array.
+    # Standardize the output used in the feature calculation. If a routine
+    # returns both the data and its bin edges, extract the data and return it
+    # as a NumPy array.
     @staticmethod
     def _array_only(result: Any, method_name: str) -> Any:
         if isinstance(result, tuple):
@@ -439,14 +439,15 @@ class NotebookCompatibleAegis:
             result = result[0]
         return np.asarray(result)
 
-    # Expose the selected-pixel count map as a NumPy array. Pass the caller's
-    # arguments to the engine and normalize the return value.
+    # Build a table with one row per selected sky pixel and one column per
+    # energy band. Each cell gives the number of events in that pixel and band.
     def get_roi_map_summary(self, *args: Any, **kwargs: Any) -> Any:
         result = self._engine.get_roi_map_summary(*args, **kwargs)
         return self._array_only(result, "get_roi_map_summary")
 
-    # Expose the histogram for a count map as a NumPy array. Forward the input
-    # map and binning options to the engine and normalize the return value.
+    # Count how many selected pixels fall into each photon-count bin. Use the
+    # supplied bin limits and spacing and return the histogram as a NumPy
+    # array.
     def get_counts_histogram_from_roi_map(
         self, *args: Any, **kwargs: Any
     ) -> Any:
@@ -454,9 +455,9 @@ class NotebookCompatibleAegis:
         return self._array_only(result, "get_counts_histogram_from_roi_map")
 
 
-# Initialize the processing engine from the configured source file. Verify
-# where Python imported it from, convert angle settings to radians, and wrap
-# the configured engine in the array adapter.
+# Set up the count-map and histogram routines with the configured ranges and
+# units. Verify the source file so the run uses the intended AEGIS
+# implementation.
 def build_aegis_object(configuration: dict[str, Any]) -> NotebookCompatibleAegis:
     """Import the configured AEGIS source and build the notebook's engine."""
 
@@ -510,9 +511,9 @@ def build_aegis_object(configuration: dict[str, Any]) -> NotebookCompatibleAegis
     return NotebookCompatibleAegis(engine)
 
 
-# Turn one dataset into a fixed-length feature vector. Select pixels, cap their
-# counts, and build a histogram for each energy band. Verify that each
-# histogram accounts for every selected pixel, then flatten the table.
+# Build one feature row by counting how many selected pixels fall into each
+# count bin within each energy band. Check that each band accounts for every
+# selected pixel, then flatten the table with energy bands varying fastest.
 def compute_summary_statistics(
     photon_info: dict[str, Any],
     my_AEGIS: NotebookCompatibleAegis,
@@ -591,9 +592,9 @@ def compute_summary_statistics(
     return counts_energy_hist.flatten()
 
 
-# Assemble one feature row per dataset in input order. Use Joblib threads to
-# process each batch, validate the results, and copy them into a preallocated
-# float32 array. Release the batch arrays once copied.
+# Build a feature matrix with one row per dataset in input order. Process
+# datasets in parallel batches and check that each row has the expected number
+# of finite, non-negative entries.
 def compute_all_histograms(
     data_list: list[dict[str, Any]],
     *,
@@ -658,9 +659,9 @@ def compute_all_histograms(
     return counts_energy_histograms
 
 
-# Build consistent filenames for the three outputs. Use the case's filename
-# label and the dataset count to name the histograms, parameter rows, and
-# metadata.
+# Use the case label and dataset count to name the feature matrix, matching
+# parameter table, and run record so readers can identify the files that belong
+# together.
 def output_paths(
     *,
     filename_qualifier: str,
@@ -674,8 +675,8 @@ def output_paths(
     }
 
 
-# Compute the number of pixels to record in the run metadata. Apply both
-# selection thresholds to the pixel grid and count the pixels that pass.
+# Count the pixels that pass both selection rules. Record that total in the run
+# metadata as the number of pixels represented in each energy band's histogram.
 def roi_pixel_count(configuration: dict[str, Any]) -> int:
     """Compute the ROI size for metadata using the notebook's mask."""
 
@@ -696,9 +697,9 @@ def roi_pixel_count(configuration: dict[str, Any]) -> int:
     return int(roi_pix_i.size)
 
 
-# Describe the run so future runs can check compatibility. Record input
-# fingerprints, processing settings, software versions, and expected output
-# shapes in a dictionary.
+# Document how the feature matrix was produced. Record input checksums,
+# parameter alignment, bin settings, software versions, and expected output
+# shapes so later runs can be compared.
 def build_comparison_metadata(
     *,
     configuration: dict[str, Any],
@@ -813,8 +814,9 @@ def build_comparison_metadata(
     }
 
 
-# Serialize metadata consistently before hashing it. Sort dictionary keys, use
-# compact JSON formatting, and encode the result as UTF-8.
+# Put the run record into a consistent format before hashing it. Sort the JSON
+# keys so the fingerprint depends on the recorded values and field names
+# regardless of their order.
 def canonical_json_bytes(value: Any) -> bytes:
     return json.dumps(
         value,
@@ -824,15 +826,15 @@ def canonical_json_bytes(value: Any) -> bytes:
     ).encode("utf-8")
 
 
-# Create a stable identifier for the comparison metadata. Serialize it
-# consistently and return the hexadecimal SHA-256 hash of the resulting bytes.
+# Compute a SHA-256 fingerprint of the run record. Use it to check whether two
+# runs have the same recorded inputs and settings.
 def metadata_fingerprint(comparison_metadata: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_json_bytes(comparison_metadata)).hexdigest()
 
 
-# Check whether a prior run's comparison metadata matches the current run. Read
-# the saved JSON, compare fingerprints, and return a match flag with the
-# reason.
+# Compare the current run record with the one saved alongside earlier results.
+# Return the outcome and a reason so the caller can decide whether to replace
+# those results.
 def existing_metadata_matches(
     metadata_path: Path,
     current_comparison_metadata: dict[str, Any],
@@ -862,9 +864,9 @@ def existing_metadata_matches(
     )
 
 
-# Decide whether computation can proceed. Allow new outputs or matching
-# metadata automatically. Require explicit confirmation from an interactive
-# terminal in other cases.
+# Protect earlier results before starting a new computation. Proceed
+# automatically when writing new files or when the saved metadata matches. Ask
+# for explicit confirmation for other replacements.
 def approve_computation_or_overwrite(
     *,
     paths: dict[str, Path],
@@ -911,9 +913,8 @@ def approve_computation_or_overwrite(
     return False
 
 
-# Prepare a complete NumPy file for later replacement. Write and sync the array
-# to a temporary file beside the destination, then return its path. Remove the
-# temporary file if writing fails.
+# Write the feature matrix or parameter table to a temporary NumPy file. Finish
+# writing and sync it to disk before it can replace the final output.
 def stage_npy(path: Path, array: np.ndarray) -> Path:
     file_descriptor, temporary_name = tempfile.mkstemp(
         dir=path.parent,
@@ -932,9 +933,8 @@ def stage_npy(path: Path, array: np.ndarray) -> Path:
     return temporary_path
 
 
-# Prepare a complete metadata file for later replacement. Write readable JSON
-# with sorted keys to a temporary file, sync it, and return its path. Remove
-# the temporary file if writing fails.
+# Write the run record as readable JSON in a temporary file. Finish writing and
+# sync it to disk so it is ready to save alongside the results.
 def stage_json(path: Path, value: dict[str, Any]) -> Path:
     file_descriptor, temporary_name = tempfile.mkstemp(
         dir=path.parent,
@@ -955,9 +955,9 @@ def stage_json(path: Path, value: dict[str, Any]) -> Path:
     return temporary_path
 
 
-# Write the arrays and metadata to their final paths. Stage all three files
-# first, replace the arrays before the metadata, and remove any leftover
-# temporary files.
+# Save the feature matrix, corresponding parameter table, and run record.
+# Prepare all three files first and place the metadata last as the completion
+# marker.
 def save_output_artifacts(
     *,
     paths: dict[str, Path],
@@ -986,8 +986,8 @@ def save_output_artifacts(
             temporary_path.unlink(missing_ok=True)
 
 
-# Define the command-line interface. Use argparse to apply defaults, parse
-# integer settings, and enforce the supported case option.
+# Read the command-line options for the case, worker count, and batch size.
+# Apply defaults when options are omitted.
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -1016,9 +1016,9 @@ def parse_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-# Run the pipeline from input validation through output writing. Check the
-# settings and overwrite decision, compute and validate the feature matrix,
-# then save it with its parameter rows and run metadata.
+# Run the analysis from raw event data to saved features. Validate the inputs,
+# align the parameter rows, and check whether earlier results can be replaced.
+# Then build and save the feature matrix with its run record.
 def main() -> int:
     arguments = parse_arguments()
     if arguments.num_workers == 0 or arguments.num_workers < -1:
